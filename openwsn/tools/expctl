@@ -1,0 +1,437 @@
+#! /usr/bin/python
+#---------------------------------------------------------------------------
+# Experiment management tool
+#
+# Cedric Adjih - Inria - 2014
+#---------------------------------------------------------------------------
+
+import sys, os, re, pprint
+import warnings
+
+#thisScriptPath = os.path.realpath(inspect.getfile(inspect.currentframe()))
+#thisDirName = os.path.dirname(thisScriptPath)
+#sys.path.append(thisDirName) # XXX: be cleaner
+
+import webbrowser
+import argparse
+import IotlabHelper
+from IotlabHelper import extractNodeId, AllPossibleNodes
+
+try: 
+    import ExpGui # comment if pb and you don't need a GUI
+except ImportError: 
+    warnings.warn("could not 'import ExpGui', skipping it (some operations will fail)")
+
+#---------------------------------------------------------------------------
+# utils
+#---------------------------------------------------------------------------
+
+def getLastExpId():
+    lastExpLink = os.readlink(IotlabHelper.LastExpSymLink)
+    rExpId = re.compile(IotlabHelper.ExpTemplateDir.replace("%s", "([0-9]+)"))
+    mExpId = rExpId.search(lastExpLink)
+    if mExpId == None:
+        raise RuntimeError("Cannot parse %s" % IotlabHelper.LastExpSymLink,
+                           (IotlabHelper.ExpTemplateDir, lastExpLink))
+    expId = int(mExpId.group(1))
+    return expId
+
+def getHelperAndExp(args, server=None):
+    iotlab = IotlabHelper.IotlabHelper(server)
+    exp = iotlab._makeExp(args.exp_id)
+    expInfo = exp.getPersistentInfo()
+    if (server == None and "args" in expInfo 
+        and expInfo["args"].get("dev") != None):
+        return getHelperAndExp(args, expInfo["args"]["dev"])
+    else: return iotlab, exp
+
+def getProcessManager(exp):
+    processManager = IotlabHelper.ProcessManager(False)
+    if exp == None:
+        name = "Pre-Experiment"
+    else: name = exp.getPersistentInfo()["name"]
+    processManager.setWindowTitle(name)
+    return processManager
+
+#---------------------------------------------------------------------------
+# Commands
+#---------------------------------------------------------------------------
+
+ForwardedTypeList = ["contiki-border-router", "zep-sniffer", "foren6-sniffer",
+                     "openwsn", "openwsn-sink", "riot", "riot-viz",
+                     "opera", "opera-sink"]
+
+def cmdSshForward(args):
+    iotlab, exp = getHelperAndExp(args)
+    processManager = getProcessManager(exp)
+    expInfo = exp.getPersistentInfo()
+
+    currentPort = [args.start_port] # ugly use because 'nonlocal' not in Py2.7
+    def getNewPort():
+        result = currentPort[0]
+        currentPort[0] += 1
+        return result
+
+    forwardedTypeList = ForwardedTypeList[:]
+    if args.type != None:
+        forwardedTypeList.append(args.type)
+
+    forwardByType = {}
+    redirectList = []
+    nodes = []
+    for typeName, typeInfo in expInfo["nodeInfoByType"].iteritems():
+        if typeName in forwardedTypeList:
+            forwardList = [(node,getNewPort()) for node in typeInfo["nodes"]]
+            redirectList.extend(
+                ["-L %s:%s:%s" % (port, node, IotlabHelper.SerialTcpPort)
+                 for (node,port) in forwardList ])
+            nodes.extend(typeInfo["nodes"])
+            assert typeName not in forwardByType
+            forwardByType[typeName] = forwardList
+
+    exp.writeFile("ssh-forward-port.json", IotlabHelper.toJson(forwardByType))
+ 
+    expServer = IotlabHelper.getExpUniqueServer(exp, nodes)
+    #cmd = "echo FORWARDING PORTS ; TERM=xterm watch -t 'date +ssh_port_forward///%c' ; sleep 600000"
+    cmd = "echo FORWARDING PORTS \(through ssh, for use by other programs\)...; sleep 600000"
+    sshRedirectPortStr = " ".join(redirectList)
+    sshSnifferTunnelCommand = "ssh -T %s@%s %s '%s'" % (
+        iotlab.userName, expServer, sshRedirectPortStr, cmd)
+    #print sshSnifferTunnelCommand
+    print "+", cmd
+    processManager.startSubProcessInTerm("ssh tunnels to IoT-LAB", 
+                                         sshSnifferTunnelCommand)
+
+#---------------------------------------------------------------------------
+
+TunslipBinFileName = "../local/bin/tunslip6"
+
+def cmdTunslip6(args):
+    iotlab, exp = getHelperAndExp(args)
+    processManager = getProcessManager(exp)
+    
+    forwardByType = IotlabHelper.fromJson(exp.readFile("ssh-forward-port.json"))
+    borderRouterList = forwardByType.get("contiki-border-router")
+    for node, port in borderRouterList:
+        tunslipCommand = ("sudo " +TunslipBinFileName
+                          +" aaaa::1/64 -L -a localhost"
+                          + " -p %s"% port)
+        print "++", tunslipCommand
+        processManager.startSubProcessInTerm("Contiki tunslip6 %s" % node, 
+                                             tunslipCommand)
+
+#---------------------------------------------------------------------------
+
+def cmdPseudoTty(args):
+    iotlab, exp = getHelperAndExp(args)
+    processManager = getProcessManager(exp)
+    
+    forwardByType = IotlabHelper.fromJson(exp.readFile("ssh-forward-port.json"))
+    borderRouterList = forwardByType.get("openwsn-sink")
+    routerList = borderRouterList 
+    if args.all:
+        routerList += forwardByType.get("openwsn")
+    for i,(node, port) in enumerate(routerList):
+        socatCommand = ("sudo socat TCP4:localhost:%s " % port
+                        + "pty,link=/dev/ttyUSB-pseudo-%s,raw" % i)
+        print "++", socatCommand
+        processManager.startSubProcessInTerm("Socat %s" % node, socatCommand)
+
+#---------------------------------------------------------------------------
+
+def cmdForen6Sniffers(args):
+    iotlab, exp = getHelperAndExp(args)
+    processManager = getProcessManager(exp)
+    forwardByType = IotlabHelper.fromJson(exp.readFile("ssh-forward-port.json"))
+    borderRouterList = forwardByType.get("foren6-sniffer")
+    cmd = "./ConnectionTool.py connect --input foren6 --output %s" % args.output
+    cmd += " --nodes " 
+    cmd += " ".join(["localhost:%s:%s"%(port,node)
+                     for (node,port) in borderRouterList])
+    print "+", cmd
+    processManager.startSubProcessInTerm("Foren6 sniffers", cmd)
+
+def cmdForen6(args):
+    iotlab, exp = getHelperAndExp(args)
+    processManager = getProcessManager(exp)
+    cmd = "cd .. && make run-foren6"
+    print "+", cmd
+    processManager.startSubProcessInTerm("Foren6", cmd)
+
+#---------------------------------------------------------------------------
+
+#XXX: this is a big hack
+def registerNodeState(command, nodeList):
+    print command, nodeList
+
+def cmdNodeTypeCmd(args):
+    iotlab, exp = getHelperAndExp(args)
+    expInfo = exp.getPersistentInfo()
+    nodeList = []
+    for typeName in args.typeList:
+        typeInfo = expInfo["nodeInfoByType"][typeName]
+        nodeList.extend(typeInfo["nodes"])
+    print "+", args.command, " ".join(nodeList)
+    result = exp.doNodeCmd(args.command, nodeList)
+    registerNodeState(args.command, nodeList)
+    pprint.pprint(result)
+
+def cmdNodeCmd(args):
+    iotlab, exp = getHelperAndExp(args)
+    expInfo = exp.getPersistentInfo()
+    nodeList = args.nodeList
+    print "+", args.command, " ".join(nodeList)
+    realCmd = args.command.split("-")[0]
+    result = exp.doNodeCmd(realCmd, nodeList)
+    registerNodeState(realCmd, nodeList)
+    pprint.pprint(result)
+
+#---------------------------------------------------------------------------    
+
+def cmdInfo(args):
+    iotlab, exp = getHelperAndExp(args)
+    pprint.pprint(exp.getPersistentInfo())
+
+#---------------------------------------------------------------------------    
+
+def cmdGui(args):
+    iotlab, exp = getHelperAndExp(args)
+    if args.full_topology:
+        ExpGui.DisplayHack = False # XXX: clean up
+    ExpGui.runGui(iotlab, exp, args)
+
+#---------------------------------------------------------------------------
+
+def cmdWebView(args):
+    processManager = getProcessManager(None)
+    webViewCommand = "cd ../iot-lab/web-view && echo 'Running HTTP server from https://github.com/iot-lab/iot-lab/tree/master/web-view ' && ./httpd.py"
+    processManager.startSubProcessInTerm("web-view", webViewCommand)
+    webbrowser.open("http://localhost:8000/")
+
+#---------------------------------------------------------------------------
+
+def cmdRiotTvAnchor(args):
+    processManager = getProcessManager(None)
+    riotTvAnchorCommand = "cd ../riot/Riot-TV/anchor && echo 'Running HTTP anchor from RIOT-TV' && node anchor.js"
+    processManager.startSubProcessInTerm("Riot-TV anchor", riotTvAnchorCommand)
+    webbrowser.open("http://localhost:12345/")
+
+
+def cmdRiotTvReport(args):
+    iotlab, exp = getHelperAndExp(args)
+    processManager = getProcessManager(exp)
+    forwardByType = IotlabHelper.fromJson(exp.readFile("ssh-forward-port.json"))
+    borderRouterList = forwardByType.get("riot")
+    #cmd = "./ConnectionTool.py connect --proxy --proxy-port-offset 10000  --input dump --output text" #% args.output
+    cmd = "./ConnectionTool.py connect --mux --mux-port 19999  --input line --output riot-tv-reporter"
+    cmd += " --nodes " 
+    cmd += " ".join(["localhost:%s:%s" % (port, node) 
+                     for (node, port) in borderRouterList])
+    print "+", cmd
+    processManager.startSubProcessInTerm("Riot-TV Report", cmd)
+
+def cmdRiotTvLayout(args):
+    iotlab, exp = getHelperAndExp(args)
+    processManager = getProcessManager(exp)
+    nodePosTable = exp.getCachedAllNodePos()
+    expInfo = exp.getPersistentInfo()
+    
+    if args.type not in expInfo["nodeInfoByType"]:
+        print "(no nodes of type '%s')" % args.type
+        return
+
+    addressList = expInfo["nodeInfoByType"][args.type]["nodes"]
+    nodeIdList = [extractNodeId(address) for address in addressList]
+    LayoutFileName = "../riot/Riot-TV/anchor/data/current-layout.json"
+    try: os.remove(LayoutFileName)
+    except: pass
+
+    infoNodeList = []
+
+    for nodeId in nodeIdList:
+        if nodeId in nodePosTable:
+            x,y,z = nodePosTable[nodeId]
+            if args.swap_xy:
+                x,y = (-y,x)
+            info = {
+                "id": "m3-%d" % nodeId, 
+                "params": { "color":"#ee2222", "size":15, "x":x, "y":y} 
+                }
+            infoNodeList.append(info)
+
+    layout = {
+        "nodes": infoNodeList,
+        "edges": [ ]
+        }
+
+    f = open(LayoutFileName, "w") # XXX: make a link to here + change here
+    f.write(IotlabHelper.toJson(layout))
+    f.close()
+
+#---------------------------------------------------------------------------
+
+def cmdFlash(args):
+    iotlab, exp = getHelperAndExp(args)
+    expInfo = exp.getPersistentInfo()
+    if args.type == None and args.firmware == None:
+        raise RuntimeError("don't know what to flash")
+    expServer = None
+
+    nodeList = []
+    for nodeStr in args.nodeList:
+        if nodeStr.startswith(":"):
+            subNodeList = expInfo["nodeInfoByType"].get(nodeStr[1:], None)
+            if subNodeList == None:
+                print "(warning: no nodes of type %s)" % nodeStr[1:]
+                continue
+            subNodeList = subNodeList["nodes"]
+        else:
+            if not nodeStr.startswith("m3"): #XXX
+                nodeStr = "m3-%s" % int(nodeStr)
+            if nodeStr.find(".") < 0:
+                if expServer == None:
+                    expServer = IotlabHelper.getExpUniqueServer(exp)
+                nodeStr += "." + expServer
+            subNodeList = [nodeStr]
+        nodeList.extend(subNodeList)
+
+    if args.type != None:
+        exp.ensureFlashedStdNodes(args.type, len(nodeList), nodeList)
+    else:
+        exp.ensureFlashedNodes(os.path.basename(args.firmware), 
+                               args.firmware, len(nodeList), nodeList)
+
+#---------------------------------------------------------------------------
+
+#---------------------------------------------------------------------------
+# Special processing for "init": launch the Experiment script
+#---------------------------------------------------------------------------
+
+if len(sys.argv) > 2 and sys.argv[1] == "init":
+    os.execl("/usr/bin/python", *["/usr/bin/python"]+sys.argv[2:])
+    raise RuntimeError("should not happen") # due to execle
+
+#---------------------------------------------------------------------------
+# Main program
+#---------------------------------------------------------------------------
+
+SshTunnelStartPort = 3000
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--exp-id", type=int, default=None)
+
+subparsers = parser.add_subparsers(dest="command")
+
+infoParser = subparsers.add_parser("info")
+
+flashParser = subparsers.add_parser("flash")
+flashParser.add_argument("nodeList", nargs="+")
+flashParser.add_argument("--firmware", type=str, default=None)
+flashParser.add_argument("--type", type=str, default=None)
+
+#sshForwardParser = subparsers.add_parser("ssh-forward")
+#sshForwardParser.add_argument("--start-port", type=int, 
+#                              default=SshTunnelStartPort)
+
+tunslip6Parser = subparsers.add_parser("tunslip6")
+
+pseudoTtyParser = subparsers.add_parser("pseudo-tty")
+pseudoTtyParser.add_argument("--all", action="store_true", default=False)
+
+sshForwardParser = subparsers.add_parser("ssh-forward")
+sshForwardParser.add_argument("--start-port", type=int, 
+                              default=SshTunnelStartPort)
+sshForwardParser.add_argument("--type", type=str, default=None)
+
+nodeTypeCmdParserTable = {}
+for nodeTypeCmd in ["reset", "stop", "start"]:
+    nodeTypeCmdParser = subparsers.add_parser(nodeTypeCmd)
+    nodeTypeCmdParser.add_argument("typeList", nargs="+")
+    nodeTypeCmdParserTable[nodeTypeCmd] = nodeTypeCmd
+
+nodeCmdParserTable = {}
+for nodeCmd in ["reset-node", "stop-node", "start-node"]:
+    nodeCmdParser = subparsers.add_parser(nodeCmd)
+    nodeCmdParser.add_argument("nodeList", nargs="+")
+    nodeCmdParserTable[nodeCmd] = nodeCmd
+
+
+foren6SniffersParser = subparsers.add_parser("foren6-sniffers")
+foren6SniffersParser.add_argument("--output", type=str, 
+                                  default="wireshark+socat",
+                                  choices=["wireshark", "tshark", "socat",
+                                           "wireshark+socat",
+                                           "wireshark+smartrf"])
+#foren6SniffersParser.add_argument("--output-zep", action="store_true",
+#                                  default=False)
+
+
+foren6Parser = subparsers.add_parser("foren6")
+
+guiParser = subparsers.add_parser("gui")
+guiParser.add_argument("--width", type=int, default=800)
+guiParser.add_argument("--height", type=int, default=600)
+guiParser.add_argument("--full-topology", action="store_true", default=False)
+
+webViewParser = subparsers.add_parser("web-view")
+webViewParser.add_argument("--no-browser", action="store_true", default=False)
+
+
+riotTvParser = subparsers.add_parser("riot-tv")
+riotTvSubParsers = riotTvParser.add_subparsers(dest="riotCommand")
+
+riotTvParser = riotTvSubParsers.add_parser("anchor")
+riotTvParser.add_argument("--no-browser", action="store_true", default=False)
+
+
+riotTvLayoutParser = riotTvSubParsers.add_parser("layout")
+riotTvLayoutParser.add_argument("--type", type=str, default="riot")
+riotTvLayoutParser.add_argument("--swap-xy", action="store_true", default=False)
+
+riotTvReportParser = riotTvSubParsers.add_parser("report")
+
+
+args = parser.parse_args()
+
+if args.exp_id == None:
+    if os.path.exists(IotlabHelper.LastExpSymLink):
+        expId = getLastExpId()
+        print "(no experiment id specified, using last one: exp %s)" % expId
+    else:
+        expId = None
+        print "(no running experiment)"
+    args.exp_id = expId
+
+if args.command == "flash":
+    cmdFlash(args)
+elif args.command == "info":
+    cmdInfo(args)
+elif args.command == "ssh-forward":
+    cmdSshForward(args)
+elif args.command == "tunslip6":
+    cmdTunslip6(args)
+elif args.command == "pseudo-tty":
+    cmdPseudoTty(args)
+elif args.command == "foren6-sniffers":
+    cmdForen6Sniffers(args)
+elif args.command == "foren6":
+    cmdForen6(args)
+elif args.command == "gui":
+    cmdGui(args)
+elif args.command == "web-view":
+    cmdWebView(args)
+elif args.command == "riot-tv":
+    if args.riotCommand == "anchor":
+        cmdRiotTvAnchor(args)
+    elif args.riotCommand == "layout":
+        cmdRiotTvLayout(args)
+    elif args.riotCommand == "report":
+        cmdRiotTvReport(args)
+    else: raise RuntimeError("Unexpected command", args.command)
+elif args.command in nodeCmdParserTable:
+    cmdNodeCmd(args)
+elif args.command in nodeTypeCmdParserTable:
+    cmdNodeTypeCmd(args)
+else: raise RuntimeError("Unexpected command", args.command)
+
+#---------------------------------------------------------------------------
